@@ -1,21 +1,23 @@
+from typing import Optional, Union, Tuple, List
+
 import torch
 import torch.nn as nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import torch.nn.functional as F
+from torch.nn import CrossEntropyLoss, MSELoss
 
 from transformers import apply_chunking_to_forward
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa, _prepare_4d_causal_attention_mask_for_sdpa
+from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
 from transformers.models.bert.modeling_bert import (
-    BertConfig,
-    BertPreTrainedModel,
     BertAttention,
     SequenceClassifierOutput,
     BertForSequenceClassification,
-    BertModel,
     BertEncoder,
     BertEmbeddings,
     BertPooler,
-    BertLayer,
     BertIntermediate,
     BertOutput,
+    BertPreTrainedModel,
 )
 
 
@@ -37,58 +39,31 @@ class MoE(nn.Module):
 
     def forward(self, hidden_states):
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_states_flat = hidden_states.view(-1, hidden_dim)
-        num_tokens = hidden_states_flat.size(0)
+        hidden_flat = hidden_states.view(-1, hidden_dim)         # [B*T, H]
+        num_tokens = hidden_flat.size(0)
 
-        # Логиты маршрутизации
-        router_logits = self.router(hidden_states_flat)  # [num_tokens, num_experts]
-        router_probs = nn.functional.softmax(router_logits, dim=-1)
+        # 1) Получаем, какой эксперт на каждый токен:
+        router_logits = self.router(hidden_flat)                  # [num_tokens, E]
+        router_probs  = F.softmax(router_logits, dim=-1)
+        topk_vals, topk_idx = router_probs.topk(self.top_k, dim=-1)
+        topk_idx = topk_idx.squeeze(-1)                          # [num_tokens]
 
-        # Выбираем top_k экспертов
-        top_k_probs, top_k_indices = router_probs.topk(self.top_k, dim=-1)
-        top_k_indices = top_k_indices.squeeze(-1)  # [num_tokens, top_k] -> [num_tokens] при top_k=1
-        top_k_probs = top_k_probs.squeeze(-1)
+        # 2) Подготовим тензор-выход
+        intermediate = hidden_flat.new_zeros(
+            num_tokens, self.config.intermediate_size
+        )
 
-        # Сортируем токены по индексу эксперта
-        sorted_expert_indices, sorted_index = top_k_indices.sort(dim=0)
-        sorted_inputs = hidden_states_flat[sorted_index]
+        # 3) Для каждого эксперта вычислим его выход исключительно на своих токенах
+        for expert_id, expert in enumerate(self.experts):
+            mask = topk_idx == expert_id                       # булева маска [num_tokens]
+            if mask.any():
+                inp_i = hidden_flat[mask]                      # [num_selected, H]
+                out_i = expert(inp_i)                          # [num_selected, D]
+                intermediate[mask] = out_i
 
-        # Границы групп для каждого эксперта
-        diff = sorted_expert_indices[1:] - sorted_expert_indices[:-1]
-        boundaries = torch.cat([
-            torch.tensor([0], device=hidden_states.device),
-            (diff != 0).nonzero(as_tuple=True)[0] + 1,
-            torch.tensor([num_tokens], device=hidden_states.device)
-        ])
-
-        # Обработка экспертов
-        intermediate_output = torch.zeros(num_tokens, self.config.intermediate_size, device=hidden_states.device)
-        for i in range(self.num_experts):
-            start = boundaries[i]
-            end = boundaries[i + 1]
-            if start < end:
-                expert_input = sorted_inputs[start:end]
-                expert_output = self.experts[i](expert_input)
-                intermediate_output[start:end] = expert_output
-
-        # Возвращаем исходный порядок
-        intermediate_output = intermediate_output[torch.argsort(sorted_index)]
-
-        # Применяем выходной слой (residual + LayerNorm)
-        output = self.output(intermediate_output, hidden_states_flat)
-        output = output.view(batch_size, seq_len, hidden_dim)
-
-        # Расчет вспомогательного лосса (балансировка нагрузки)
-        if self.training:
-            density = torch.zeros(self.num_experts, device=router_probs.device)
-            density.index_add_(0, top_k_indices, torch.ones(num_tokens, device=router_probs.device))
-            density /= num_tokens
-            importance = router_probs.sum(dim=0) / num_tokens
-            aux_loss = self.aux_loss_coef * self.num_experts * (density * importance).sum()
-            self.aux_loss = aux_loss
-        else:
-            self.aux_loss = 0.0
-
+        # 4) Восстанавливаем исходный порядок + остаток
+        intermediate = intermediate.view(batch_size, seq_len, -1)
+        output = self.output(intermediate, hidden_states)
         return output
 
 
@@ -115,6 +90,7 @@ class BertLayerWithMoE(nn.Module):
             head_mask=None,
             encoder_hidden_states=None,
             encoder_attention_mask=None,
+            past_key_value=None,
             output_attentions=False,
     ):
         # Self-Attention
@@ -125,10 +101,15 @@ class BertLayerWithMoE(nn.Module):
             output_attentions=output_attentions,
         )
         attention_output = self_attention_outputs[0]
-        outputs = self_attention_outputs[1:]  # Сохраняем attention weights
+        outputs = self_attention_outputs[1:]  # add self-attentions if we output attention weights
 
-        # Cross-Attention
+        # Cross-Attention for decoder if applicable
         if self.is_decoder and encoder_hidden_states is not None:
+            # ensure cross-attention layers exist if encoder hidden states are passed
+            assert hasattr(self, "crossattention"), (
+                f"If `encoder_hidden_states` are passed, {self} has to be instantiated "
+                "with cross-attention layers by setting `config.add_cross_attention=True`"
+            )
             cross_attention_outputs = self.crossattention(
                 attention_output,
                 attention_mask,
@@ -138,9 +119,9 @@ class BertLayerWithMoE(nn.Module):
                 output_attentions,
             )
             attention_output = cross_attention_outputs[0]
-            outputs = outputs + cross_attention_outputs[1:]  # Добавляем cross attention weights
+            outputs = outputs + cross_attention_outputs[1:]  # add cross-attentions if we output attention weights
 
-        # MoE вместо FFN
+        # Feed-forward / Mixture-of-Experts block
         layer_output = apply_chunking_to_forward(
             self.feed_forward_chunk,
             self.chunk_size_feed_forward,
@@ -159,17 +140,183 @@ class BertMoEEncoder(BertEncoder):
         super(BertEncoder, self).__init__()
         self.config = config
         self.layer = nn.ModuleList([BertLayerWithMoE(config) for _ in range(config.num_hidden_layers)])
+        self.gradient_checkpointing = False
 
 
-class BertMoEModel(BertModel):
+class BertMoEModel(BertPreTrainedModel):
     def __init__(self, config, add_pooling_layer=True):
-        super(BertModel, self).__init__(config)
+        super().__init__(config)
         self.config = config
+
+        self.attn_implementation = getattr(config, "attn_implementation", "eager")
+        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
+
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertMoEEncoder(config)
         self.pooler = BertPooler(config) if add_pooling_layer else None
         self.init_weights()
 
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
+        r"""
+        encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
+            the model is configured as a decoder.
+        encoder_attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)` or `(batch_size, sequence_length, target_length)`, *optional*):
+            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
+            the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+        past_key_values (`tuple(tuple(torch.FloatTensor))` of length `config.n_layers` with each tuple having 4 tensors of shape `(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`):
+            Contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
+
+            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
+            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
+            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
+        use_cache (`bool`, *optional*):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`).
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if self.config.is_decoder:
+            use_cache = use_cache if use_cache is not None else self.config.use_cache
+        else:
+            use_cache = False
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        batch_size, seq_length = input_shape
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        # past_key_values_length
+        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+
+        if token_type_ids is None:
+            if hasattr(self.embeddings, "token_type_ids"):
+                buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
+                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
+                token_type_ids = buffered_token_type_ids_expanded
+            else:
+                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+            past_key_values_length=past_key_values_length,
+        )
+
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
+
+        use_sdpa_attention_masks = (
+            self.attn_implementation == "sdpa"
+            and self.position_embedding_type == "absolute"
+            and head_mask is None
+            and not output_attentions
+        )
+
+        # Expand the attention mask
+        if use_sdpa_attention_masks and attention_mask.dim() == 2:
+            # Expand the attention mask for SDPA.
+            # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
+            if self.config.is_decoder:
+                extended_attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                    attention_mask,
+                    input_shape,
+                    embedding_output,
+                    past_key_values_length,
+                )
+            else:
+                extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
+                    attention_mask, embedding_output.dtype, tgt_len=seq_length
+                )
+        else:
+            # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+            # ourselves in which case we just need to make it broadcastable to all heads.
+            extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape)
+
+        # If a 2D or 3D attention mask is provided for the cross-attention
+        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        if self.config.is_decoder and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+
+            if use_sdpa_attention_masks and encoder_attention_mask.dim() == 2:
+                # Expand the attention mask for SDPA.
+                # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
+                encoder_extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
+                    encoder_attention_mask, embedding_output.dtype, tgt_len=seq_length
+                )
+            else:
+                encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape bsz x n_heads x N x N
+        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
+        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_extended_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = encoder_outputs[0]
+        pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+
+        if not return_dict:
+            return (sequence_output, pooled_output) + encoder_outputs[1:]
+
+        return BaseModelOutputWithPoolingAndCrossAttentions(
+            last_hidden_state=sequence_output,
+            pooler_output=pooled_output,
+            past_key_values=encoder_outputs.past_key_values,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+            cross_attentions=encoder_outputs.cross_attentions,
+        )
 
 class BertMoEForSequenceClassification(BertForSequenceClassification):
     def __init__(self, config):
