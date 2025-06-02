@@ -6,7 +6,10 @@ import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, MSELoss
 
 from transformers import apply_chunking_to_forward
-from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa, _prepare_4d_causal_attention_mask_for_sdpa
+from transformers.modeling_attn_mask_utils import (
+    _prepare_4d_attention_mask_for_sdpa,
+    _prepare_4d_causal_attention_mask_for_sdpa,
+)
 from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
 from transformers.models.bert.modeling_bert import (
     BertAttention,
@@ -22,15 +25,36 @@ from transformers.models.bert.modeling_bert import (
 
 
 class MoE(nn.Module):
+    """
+    Represents a Mixture of Experts (MoE) layer.
+
+    This layer combines multiple "expert" networks to handle different aspects of the input data.
+    It uses a gating network to determine which experts to use for each input.
+
+    Attributes:
+        config: Configuration object containing MoE-related parameters.  Defines the MoE layer's settings.
+    """
+
     def __init__(self, config):
+        """
+        Initializes the Mixture of Experts (MoE) layer.
+
+            Args:
+                config: Configuration object containing MoE-related parameters.
+
+            Returns:
+                None
+        """
         super().__init__()
         self.config = config
-        self.num_experts = getattr(config, 'moe_num_experts', 4)
-        self.top_k = getattr(config, 'moe_top_k', 1)
-        self.aux_loss_coef = getattr(config, 'moe_aux_loss_coef', 0.1)
+        self.num_experts = getattr(config, "moe_num_experts", 4)
+        self.top_k = getattr(config, "moe_top_k", 1)
+        self.aux_loss_coef = getattr(config, "moe_aux_loss_coef", 0.1)
 
         # Создаем экспертов (каждый эксперт - это FFN)
-        self.experts = nn.ModuleList([BertIntermediate(config) for _ in range(self.num_experts)])
+        self.experts = nn.ModuleList(
+            [BertIntermediate(config) for _ in range(self.num_experts)]
+        )
         self.output = BertOutput(config)  # Общий выходной слой
 
         # Маршрутизатор (роутер)
@@ -38,27 +62,36 @@ class MoE(nn.Module):
         self.aux_loss = 0.0  # Для накопления вспомогательного лосса
 
     def forward(self, hidden_states):
+        """
+        Performs the forward pass of the Mixture of Experts (MoE) layer.
+
+        Args:
+            hidden_states: The input hidden states.
+            batch_size: The batch size.
+            seq_len: The sequence length.
+
+        Returns:
+            The output tensor after passing through the MoE layer.
+        """
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_flat = hidden_states.view(-1, hidden_dim)         # [B*T, H]
+        hidden_flat = hidden_states.view(-1, hidden_dim)  # [B*T, H]
         num_tokens = hidden_flat.size(0)
 
         # 1) Получаем, какой эксперт на каждый токен:
-        router_logits = self.router(hidden_flat)                  # [num_tokens, E]
-        router_probs  = F.softmax(router_logits, dim=-1)
+        router_logits = self.router(hidden_flat)  # [num_tokens, E]
+        router_probs = F.softmax(router_logits, dim=-1)
         topk_vals, topk_idx = router_probs.topk(self.top_k, dim=-1)
-        topk_idx = topk_idx.squeeze(-1)                          # [num_tokens]
+        topk_idx = topk_idx.squeeze(-1)  # [num_tokens]
 
         # 2) Подготовим тензор-выход
-        intermediate = hidden_flat.new_zeros(
-            num_tokens, self.config.intermediate_size
-        )
+        intermediate = hidden_flat.new_zeros(num_tokens, self.config.intermediate_size)
 
         # 3) Для каждого эксперта вычислим его выход исключительно на своих токенах
         for expert_id, expert in enumerate(self.experts):
-            mask = topk_idx == expert_id                       # булева маска [num_tokens]
+            mask = topk_idx == expert_id  # булева маска [num_tokens]
             if mask.any():
-                inp_i = hidden_flat[mask]                      # [num_selected, H]
-                out_i = expert(inp_i)                          # [num_selected, D]
+                inp_i = hidden_flat[mask]  # [num_selected, H]
+                out_i = expert(inp_i)  # [num_selected, D]
                 intermediate[mask] = out_i
 
         # 4) Восстанавливаем исходный порядок + остаток
@@ -68,7 +101,20 @@ class MoE(nn.Module):
 
 
 class BertLayerWithMoE(nn.Module):
+    """
+    Implements a BERT layer with Mixture of Experts (MoE) capabilities.
+
+    Attributes:
+        config: Configuration object for the layer.
+    """
+
     def __init__(self, config):
+        """
+        Initializes the MoEBertLayer.
+
+        Args:
+            config: Configuration object for the layer.
+        """
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
@@ -84,15 +130,29 @@ class BertLayerWithMoE(nn.Module):
         self.moe = MoE(config)  # Используем наш MoE-слой
 
     def forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            head_mask=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            past_key_value=None,
-            output_attentions=False,
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        past_key_value=None,
+        output_attentions=False,
     ):
+        """
+        Forward pass of the encoder.
+
+        Args:
+            hidden_states: The hidden states to be processed.
+            attention_mask: Mask used to avoid attention to padding tokens.
+            head_mask: Mask used to avoid attention to certain heads.
+            encoder_hidden_states: Hidden states from the encoder, used for cross-attention.
+            encoder_attention_mask: Attention mask for the encoder hidden states.
+            output_attentions: Whether to output attention weights.
+
+        Returns:
+            A tuple containing the encoder's output and potentially attention weights.
+        """
         # Self-Attention
         self_attention_outputs = self.attention(
             hidden_states,
@@ -101,7 +161,9 @@ class BertLayerWithMoE(nn.Module):
             output_attentions=output_attentions,
         )
         attention_output = self_attention_outputs[0]
-        outputs = self_attention_outputs[1:]  # add self-attentions if we output attention weights
+        outputs = self_attention_outputs[
+            1:
+        ]  # add self-attentions if we output attention weights
 
         # Cross-Attention for decoder if applicable
         if self.is_decoder and encoder_hidden_states is not None:
@@ -119,37 +181,88 @@ class BertLayerWithMoE(nn.Module):
                 output_attentions,
             )
             attention_output = cross_attention_outputs[0]
-            outputs = outputs + cross_attention_outputs[1:]  # add cross-attentions if we output attention weights
+            outputs = (
+                outputs + cross_attention_outputs[1:]
+            )  # add cross-attentions if we output attention weights
 
         # Feed-forward / Mixture-of-Experts block
         layer_output = apply_chunking_to_forward(
             self.feed_forward_chunk,
             self.chunk_size_feed_forward,
             self.seq_len_dim,
-            attention_output
+            attention_output,
         )
         outputs = (layer_output,) + outputs
         return outputs
 
     def feed_forward_chunk(self, attention_output):
+        """
+        Performs a feed-forward pass through the hidden layers.
+
+            Args:
+                config: Configuration object containing the number of hidden layers.
+
+            Returns:
+                The output of the feed-forward pass.
+        """
         return self.moe(attention_output)
 
 
 class BertMoEEncoder(BertEncoder):
+    """
+    Encodes input sequences using a Mixture of Experts (MoE) BERT architecture.
+
+    Attributes:
+        config: Configuration object for the model.
+        add_pooling_layer: Boolean indicating whether to add a pooling layer.
+    """
+
     def __init__(self, config):
+        """
+        Initializes the model.
+
+        Args:
+            config: Configuration object.
+            add_pooling_layer: Whether to add a pooling layer.
+
+        Returns:
+            None
+        """
         super(BertEncoder, self).__init__()
         self.config = config
-        self.layer = nn.ModuleList([BertLayerWithMoE(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList(
+            [BertLayerWithMoE(config) for _ in range(config.num_hidden_layers)]
+        )
         self.gradient_checkpointing = False
 
 
 class BertMoEModel(BertPreTrainedModel):
+    """
+    A BERT model with Mixture of Experts (MoE) capabilities.
+
+    Attributes:
+        config: The configuration object for the BERT model.
+        add_pooling_layer: Whether to add a pooling layer.
+    """
+
     def __init__(self, config, add_pooling_layer=True):
+        """
+        Initializes the BertMoEModel.
+
+        Args:
+            config: The configuration object for the BERT model.
+            add_pooling_layer: Whether to add a pooling layer.
+
+        Returns:
+            None
+        """
         super().__init__(config)
         self.config = config
 
         self.attn_implementation = getattr(config, "attn_implementation", "eager")
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
+        self.position_embedding_type = getattr(
+            config, "position_embedding_type", "absolute"
+        )
 
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertMoEEncoder(config)
@@ -172,6 +285,24 @@ class BertMoEModel(BertPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
+        """
+        Performs a forward pass through the model to generate logits.
+
+        Args:
+            input_ids: Input IDs.
+            attention_mask: Attention mask.
+            token_type_ids: Token type IDs.
+            position_ids: Position IDs.
+            head_mask: Head mask.
+            inputs_embeds: Input embeddings.
+            output_attentions: Whether to output attentions.
+            output_hidden_states: Whether to output hidden states.
+            return_dict: Whether to return a dict.
+
+        Returns:
+            SequenceClassifierOutput: A SequenceClassifierOutput containing the loss, logits,
+                hidden states, and attentions.
+        """
         r"""
         encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
             Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
@@ -192,11 +323,19 @@ class BertMoEModel(BertPreTrainedModel):
             If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
             `past_key_values`).
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         if self.config.is_decoder:
             use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -204,7 +343,9 @@ class BertMoEModel(BertPreTrainedModel):
             use_cache = False
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
@@ -217,15 +358,21 @@ class BertMoEModel(BertPreTrainedModel):
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         # past_key_values_length
-        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        past_key_values_length = (
+            past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        )
 
         if token_type_ids is None:
             if hasattr(self.embeddings, "token_type_ids"):
                 buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
+                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(
+                    batch_size, seq_length
+                )
                 token_type_ids = buffered_token_type_ids_expanded
             else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+                token_type_ids = torch.zeros(
+                    input_shape, dtype=torch.long, device=device
+                )
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
@@ -236,7 +383,9 @@ class BertMoEModel(BertPreTrainedModel):
         )
 
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
+            attention_mask = torch.ones(
+                (batch_size, seq_length + past_key_values_length), device=device
+            )
 
         use_sdpa_attention_masks = (
             self.attn_implementation == "sdpa"
@@ -263,12 +412,16 @@ class BertMoEModel(BertPreTrainedModel):
         else:
             # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
             # ourselves in which case we just need to make it broadcastable to all heads.
-            extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape)
+            extended_attention_mask = self.get_extended_attention_mask(
+                attention_mask, input_shape
+            )
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
         if self.config.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_batch_size, encoder_sequence_length, _ = (
+                encoder_hidden_states.size()
+            )
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
             if encoder_attention_mask is None:
                 encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
@@ -280,7 +433,9 @@ class BertMoEModel(BertPreTrainedModel):
                     encoder_attention_mask, embedding_output.dtype, tgt_len=seq_length
                 )
             else:
-                encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+                encoder_extended_attention_mask = self.invert_attention_mask(
+                    encoder_attention_mask
+                )
         else:
             encoder_extended_attention_mask = None
 
@@ -304,7 +459,9 @@ class BertMoEModel(BertPreTrainedModel):
             return_dict=return_dict,
         )
         sequence_output = encoder_outputs[0]
-        pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+        pooled_output = (
+            self.pooler(sequence_output) if self.pooler is not None else None
+        )
 
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
@@ -318,8 +475,23 @@ class BertMoEModel(BertPreTrainedModel):
             cross_attentions=encoder_outputs.cross_attentions,
         )
 
+
 class BertMoEForSequenceClassification(BertForSequenceClassification):
+    """
+    A class for sequence classification using a Mixture of Experts (MoE) architecture
+    based on BERT.
+
+    Attributes:
+        config: The configuration object for the model.
+    """
+
     def __init__(self, config):
+        """
+        Initializes the model with the given configuration.
+
+        Args:
+            config: The configuration object for the model.
+        """
         super(BertForSequenceClassification, self).__init__(config)
         self.num_labels = config.num_labels
         self.bert = BertMoEModel(config)
@@ -328,19 +500,21 @@ class BertMoEForSequenceClassification(BertForSequenceClassification):
         self.init_weights()
 
     def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            labels=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
     ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         outputs = self.bert(
             input_ids,
